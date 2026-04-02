@@ -1,0 +1,252 @@
+"""
+마작 손패 분석 모듈
+- 샨텐수 계산
+- 유효패 계산
+- 버림패별 손패 변화 분석
+- 핵심 순간 추출
+"""
+from itertools import combinations
+from typing import Optional
+
+
+# 패 이름 → 내부 번호 변환
+def tile_name_to_id(name: str) -> Optional[int]:
+    suit_map = {"만": 0, "통": 1, "삭": 2}
+    honor_map = {"동": 27, "남": 28, "서": 29, "북": 30, "백": 31, "발": 32, "중": 33}
+    if name in honor_map:
+        return honor_map[name]
+    if len(name) >= 2 and name[-1] in suit_map:
+        try:
+            num = int(name[:-1])
+            return suit_map[name[-1]] * 9 + (num - 1)
+        except ValueError:
+            pass
+    return None
+
+
+def tiles_to_ids(tile_names: list[str]) -> list[int]:
+    result = []
+    for name in tile_names:
+        tid = tile_name_to_id(name)
+        if tid is not None:
+            result.append(tid)
+    return result
+
+
+def shanten(tiles: list[int]) -> int:
+    """
+    간단한 샨텐수 계산 (표준형 기준)
+    반환: -1=완성, 0=텐파이, 1=이샨텐, ...
+    """
+    counts = [0] * 34
+    for t in tiles:
+        if 0 <= t < 34:
+            counts[t] += 1
+
+    best = 8  # 최악의 경우
+
+    # 표준형: 4멘쯔 + 1 작두
+    for jantai in range(34):
+        if counts[jantai] < 2:
+            continue
+        counts[jantai] -= 2
+        best = min(best, _calc_shanten_mentsu(counts, 4, False))
+        counts[jantai] += 2
+
+    # 치또이 (7쌍)
+    pairs = sum(1 for c in counts if c >= 2)
+    best = min(best, 6 - pairs)
+
+    # 국사무쌍
+    terminals = [0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33]
+    unique = sum(1 for t in terminals if counts[t] >= 1)
+    has_pair = any(counts[t] >= 2 for t in terminals)
+    best = min(best, 13 - unique - (1 if has_pair else 0))
+
+    return best
+
+
+def _calc_shanten_mentsu(counts: list[int], needed: int, has_jantai: bool) -> int:
+    if needed == 0:
+        return -1
+
+    best = needed * 2 - (0 if has_jantai else 1) - 1
+
+    for i in range(34):
+        if counts[i] == 0:
+            continue
+
+        # 커쯔
+        if counts[i] >= 3:
+            counts[i] -= 3
+            result = _calc_shanten_mentsu(counts, needed - 1, has_jantai)
+            best = min(best, result)
+            counts[i] += 3
+
+        # 슌쯔 (수패만)
+        if i < 27 and i % 9 <= 6 and counts[i + 1] > 0 and counts[i + 2] > 0:
+            counts[i] -= 1
+            counts[i + 1] -= 1
+            counts[i + 2] -= 1
+            result = _calc_shanten_mentsu(counts, needed - 1, has_jantai)
+            best = min(best, result)
+            counts[i] += 1
+            counts[i + 1] += 1
+            counts[i + 2] += 1
+
+    return best
+
+
+def get_effective_tiles(hand: list[int]) -> list[int]:
+    """
+    현재 손패에서 샨텐수를 줄이는 유효패 목록 반환 (13장 기준)
+    """
+    current = shanten(hand)
+    effective = []
+    for tile in range(34):
+        new_hand = hand + [tile]
+        if shanten(new_hand) < current:
+            effective.append(tile)
+    return effective
+
+
+def analyze_discard_options(hand_14: list[int]) -> list[dict]:
+    """
+    14장 손패에서 각 버림패 선택의 결과를 분석
+    반환: [{"discard": 패이름, "shanten": n, "effective_count": n, "tenpai": bool}, ...]
+    """
+    from parser.tenhou_parser import tile_to_name
+
+    results = []
+    seen = set()
+
+    for i, tile in enumerate(hand_14):
+        if tile in seen:
+            continue
+        seen.add(tile)
+
+        remaining = hand_14[:i] + hand_14[i+1:]
+        s = shanten(remaining)
+        effective = get_effective_tiles(remaining) if s >= 0 else []
+
+        results.append({
+            "discard": tile_to_name(tile),
+            "discard_id": tile,
+            "shanten": s,
+            "effective_count": len(effective),
+            "tenpai": s == 0,
+            "effective_tiles": [tile_to_name(t) for t in effective]
+        })
+
+    results.sort(key=lambda x: (x["shanten"], -x["effective_count"]))
+    return results
+
+
+def extract_key_moments(parsed_game: dict, player_index: int = 0) -> list[dict]:
+    """
+    게임 데이터에서 핵심 타패 결정 순간 TOP 3 추출
+    실제 선택과 최선 선택의 차이(유효패 수 기준)가 큰 순간을 선택
+    """
+    from parser.tenhou_parser import tile_to_name
+
+    moments = []
+
+    for round_data in parsed_game["rounds"]:
+        draw_count = 0
+        hand = []
+
+        # 초기 손패 복원
+        if player_index < len(round_data["initial_hands"]):
+            from parser.tenhou_parser import TILE_NAMES
+            # 패 이름 → ID 변환
+            initial_names = round_data["initial_hands"][player_index]
+            hand = tiles_to_ids(initial_names)
+
+        for turn in round_data["turns"]:
+            if turn["player"] != player_index:
+                continue
+
+            if turn["action"] == "draw":
+                tile_id = tile_name_to_id(turn["tile"])
+                if tile_id is not None:
+                    hand.append(tile_id)
+                draw_count += 1
+
+            elif turn["action"] == "discard" and len(hand) == 14:
+                options = analyze_discard_options(hand[:])
+                if not options:
+                    continue
+
+                best = options[0]
+                actual_discard = turn["tile"]
+                actual = next((o for o in options if o["discard"] == actual_discard), None)
+
+                if actual and best["discard"] != actual["discard"]:
+                    diff = best["effective_count"] - actual["effective_count"]
+                    if diff >= 2:  # 유효패 2장 이상 차이날 때만 핵심 순간으로
+                        moments.append({
+                            "turn": draw_count,
+                            "round": round_data["round_index"],
+                            "actual_discard": actual_discard,
+                            "better_discard": best["discard"],
+                            "hand_before": [tile_to_name(t) for t in sorted(hand)],
+                            "actual_shanten": actual["shanten"],
+                            "better_shanten": best["shanten"],
+                            "actual_effective_count": actual["effective_count"],
+                            "better_effective_count": best["effective_count"],
+                            "better_tenpai_waits": best["effective_tiles"],
+                            "possible_yaku": _guess_yaku(hand, best["discard_id"]),
+                            "expected_score_range": _estimate_score(best),
+                            "diff_score": diff
+                        })
+
+                # 실제 버린 패를 손패에서 제거
+                tile_id = tile_name_to_id(actual_discard)
+                if tile_id is not None and tile_id in hand:
+                    hand.remove(tile_id)
+
+    # 차이가 큰 순서로 TOP 3
+    moments.sort(key=lambda x: -x["diff_score"])
+    return moments[:3]
+
+
+def _guess_yaku(hand: list[int], discard_id: int) -> list[str]:
+    """
+    간단한 역 추정 (버리고 난 13장 기준)
+    """
+    remaining = [t for t in hand if t != discard_id]
+    yaku = []
+
+    # 탄야오: 2~8 수패만
+    if all(2 <= t % 9 <= 6 for t in remaining if t < 27):
+        if all(t < 27 for t in remaining):
+            yaku.append("탄야오")
+
+    # 혼일색 가능성: 한 수패 종류 + 자패
+    for suit in range(3):
+        suit_tiles = [t for t in remaining if suit * 9 <= t < suit * 9 + 9]
+        honor_tiles = [t for t in remaining if t >= 27]
+        if len(suit_tiles) + len(honor_tiles) == len(remaining) and suit_tiles:
+            yaku.append("혼일색")
+            break
+
+    # 기본: 리치 항상 추가 (리치 가능 상황 가정)
+    if "리치" not in yaku:
+        yaku.insert(0, "리치")
+
+    return yaku[:3]
+
+
+def _estimate_score(best_option: dict) -> str:
+    """
+    예상 점수 범위 추정 (간단 버전)
+    """
+    if best_option["tenpai"]:
+        waits = best_option["effective_count"]
+        if waits >= 6:
+            return "3900~7700"
+        elif waits >= 3:
+            return "2000~5200"
+        else:
+            return "1000~3900"
+    return "계산 중"
