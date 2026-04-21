@@ -8,6 +8,8 @@ import DiscardPile from './DiscardPile'
 import CoachingSidebar from './CoachingSidebar'
 import WinModal from './WinModal'
 import SettingsPanel from '../Settings/SettingsPanel'
+import VerdictBadge from '../Common/VerdictBadge'
+import YakuTag from '../Common/YakuTag'
 
 export default function GameBoard({ gameId, onNewGame }) {
   const {
@@ -309,9 +311,27 @@ function ReactionPanel({ reactionPrompt, onRon, onClaim, onPass }) {
             onClick={() => onClaim(option.kind, option.use_types)}
             className="rounded-lg border border-amber-600/40 bg-slate-900/60 px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800 transition-colors"
           >
-            <span className="font-semibold">{option.label}</span>
-            <span className="ml-2 text-xs text-slate-400">{option.use_names?.join(' + ')}</span>
-            <p className="text-xs text-slate-500 mt-1">{option.reason}</p>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <span className="font-semibold">{option.label}</span>
+                <span className="ml-2 text-xs text-slate-400">{option.use_names?.join(' + ')}</span>
+              </div>
+              <VerdictBadge verdict={mapVerdict(option.verdict)} />
+            </div>
+            <p className="text-xs text-slate-400 mt-2 leading-relaxed">{option.reason}</p>
+            {option.detail && <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">{option.detail}</p>}
+            {(option.shanten_after !== null || option.effective_after !== null) && (
+              <div className="mt-2 flex items-center gap-3 text-[11px] text-slate-500">
+                {option.shanten_after !== null && <span>예상 {option.shanten_after}샨텐</span>}
+                {option.effective_after !== null && <span>유효패 {option.effective_after}종</span>}
+                {option.best_discard_name && <span>추천 타패 {option.best_discard_name}</span>}
+              </div>
+            )}
+            {option.yaku_preview?.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {option.yaku_preview.map((name) => <YakuTag key={name} name={name} />)}
+              </div>
+            )}
           </button>
         ))}
         <button onClick={onPass} className="rounded-lg bg-slate-700 hover:bg-slate-600 px-3 py-2 text-sm font-medium text-slate-200 transition-colors">
@@ -320,6 +340,12 @@ function ReactionPanel({ reactionPrompt, onRon, onClaim, onPass }) {
       </div>
     </div>
   )
+}
+
+function mapVerdict(verdict) {
+  if (verdict === 'correct') return 'correct'
+  if (verdict === 'mistake') return 'mistake'
+  return 'warning'
 }
 
 function AiPlayerRow({ label, seatWind, handSize, discards, melds, score }) {
