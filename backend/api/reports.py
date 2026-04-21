@@ -56,7 +56,10 @@ def get_pattern_analysis(tenhou_id: str, db: Session = Depends(get_db)):
         "warning_situations": "리치 타이밍" if len(all_moments) > 5 else "수비 전환"
     }
 
-    explanation = explain_pattern(pattern_data)
+    try:
+        explanation = explain_pattern(pattern_data)
+    except Exception:
+        explanation = None
 
     return {
         "tenhou_id": tenhou_id,
