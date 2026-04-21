@@ -10,7 +10,7 @@ from typing import Optional
 
 from game.ai_player import RuleBasedAI
 from game.tile_utils import analyze_discard_options_types, build_wall, raw_to_name, raw_to_type, type_to_name
-from game.yaku_detector import check_tenpai, check_win, count_dora, detect_yaku, estimate_score, get_hand_yaku_hints, get_winning_tiles
+from game.yaku_detector import WIND_TYPE_MAP, check_tenpai, check_win, count_dora, evaluate_hand, get_hand_yaku_hints, get_winning_tiles
 
 
 class GamePhase(str, Enum):
@@ -48,6 +48,12 @@ class ReactionOption:
     use_types: list[int]
     label: str
     reason: str
+    verdict: str = "warning"
+    detail: str = ""
+    shanten_after: Optional[int] = None
+    effective_after: Optional[int] = None
+    best_discard_name: Optional[str] = None
+    yaku_preview: list[str] = field(default_factory=list)
 
     def to_client(self) -> dict:
         return {
@@ -56,6 +62,12 @@ class ReactionOption:
             "use_names": [type_to_name(t) for t in self.use_types],
             "label": self.label,
             "reason": self.reason,
+            "verdict": self.verdict,
+            "detail": self.detail,
+            "shanten_after": self.shanten_after,
+            "effective_after": self.effective_after,
+            "best_discard_name": self.best_discard_name,
+            "yaku_preview": list(self.yaku_preview),
         }
 
 
@@ -83,6 +95,8 @@ class PlayerState:
     discards: list[int] = field(default_factory=list)
     melds: list[Meld] = field(default_factory=list)
     in_riichi: bool = False
+    ippatsu_pending: bool = False
+    riichi_turn: Optional[int] = None
     is_human: bool = False
     score: int = 25000
 
@@ -109,6 +123,8 @@ class MahjongGame:
         self.last_discard: Optional[int] = None
         self.last_discard_player: Optional[int] = None
         self.pending_reaction: Optional[PendingReaction] = None
+        self.last_draw_was_rinshan = False
+        self.last_discard_was_wall_last = False
         self.history: list[dict] = []
         self._ai = RuleBasedAI()
 
@@ -134,6 +150,8 @@ class MahjongGame:
         self.last_discard = None
         self.last_discard_player = None
         self.pending_reaction = None
+        self.last_draw_was_rinshan = False
+        self.last_discard_was_wall_last = False
         self.history = []
 
     def _draw_from_wall(self) -> int:
@@ -215,7 +233,7 @@ class MahjongGame:
         }
 
     def _build_draw_event(self, tile: Optional[int] = None, call_context: Optional[dict] = None) -> dict:
-        can_tsumo = check_win(self._full_hand(0), meld_count=self._meld_count(0))
+        can_tsumo = check_win(self._full_hand(0), meld_count=self._meld_count(0)) and self._hand_has_yaku(0, tile, True)
         options = analyze_discard_options_types(self.players[0].hand, meld_count=self._meld_count(0))
         best_discard_raw = options[0]["discard_raw"] if options else None
         yaku_hints = get_hand_yaku_hints(
@@ -252,6 +270,7 @@ class MahjongGame:
 
         self.turn_number += 1
         tile = self._draw_from_dead_wall() if from_dead_wall else self._draw_from_wall()
+        self.last_draw_was_rinshan = from_dead_wall
         self.drawn_tile = tile
         if tile >= 0:
             self.players[0].hand.append(tile)
@@ -314,8 +333,11 @@ class MahjongGame:
         self.players[0].discards.append(tile_raw)
         self.last_discard = tile_raw
         self.last_discard_player = 0
+        self.last_discard_was_wall_last = self.tiles_remaining() == 0
         self.drawn_tile = None
         self.pending_reaction = None
+        self.last_draw_was_rinshan = False
+        self.players[0].ippatsu_pending = False
 
         ai_ron_event = self._maybe_ai_ron(tile_raw)
         was_optimal = coaching_data is None
@@ -363,6 +385,8 @@ class MahjongGame:
 
         result = self.player_discard(discard_raw)
         self.players[0].in_riichi = True
+        self.players[0].ippatsu_pending = True
+        self.players[0].riichi_turn = self.turn_number
         self.players[0].score -= 1000
         self.riichi_sticks += 1
         result["riichi_declared"] = True
@@ -374,6 +398,8 @@ class MahjongGame:
     def declare_tsumo(self) -> dict:
         if not check_win(self._full_hand(0), meld_count=self._meld_count(0)):
             raise ValueError("아직 화료 형태가 아닙니다.")
+        if not self._hand_has_yaku(0, self.drawn_tile, True):
+            raise ValueError("역이 없어 화료할 수 없습니다.")
         return self._resolve_win(winner=0, win_type="tsumo", winning_tile=self.drawn_tile, loser=None)
 
     def declare_ron(self) -> dict:
@@ -382,6 +408,8 @@ class MahjongGame:
         full_hand = self._full_hand(0, self.last_discard)
         if not check_win(full_hand, meld_count=self._meld_count(0)):
             raise ValueError("론할 수 있는 형태가 아닙니다.")
+        if not self._hand_has_yaku(0, self.last_discard, False):
+            raise ValueError("역이 없어 론할 수 없습니다.")
         return self._resolve_win(winner=0, win_type="ron", winning_tile=self.last_discard, loser=self.last_discard_player)
 
     def claim_reaction(self, kind: str, use_types: list[int]) -> dict:
@@ -396,6 +424,7 @@ class MahjongGame:
         meld = Meld(kind=kind, tiles=meld_tiles, from_player=self.pending_reaction.from_player, called_tile=self.pending_reaction.discard)
         self.players[0].melds.append(meld)
         self.pending_reaction = None
+        self._clear_ippatsu_all()
 
         if kind == "kan":
             self._reveal_extra_dora()
@@ -445,8 +474,9 @@ class MahjongGame:
 
             tile = self._draw_from_wall()
             self.players[player].hand.append(tile)
+            self.last_draw_was_rinshan = False
 
-            if check_win(self._full_hand(player), meld_count=self._meld_count(player)):
+            if check_win(self._full_hand(player), meld_count=self._meld_count(player)) and self._hand_has_yaku(player, tile, True):
                 yield self._resolve_win(winner=player, win_type="tsumo", winning_tile=tile, loser=None)
                 return
 
@@ -455,6 +485,7 @@ class MahjongGame:
             self.players[player].discards.append(discard_raw)
             self.last_discard = discard_raw
             self.last_discard_player = player
+            self.last_discard_was_wall_last = self.tiles_remaining() == 0
 
             can_ron = check_win(self._full_hand(0, discard_raw), meld_count=self._meld_count(0)) and not self._is_furiten()
             reaction_options = self._reaction_options(player, discard_raw)
@@ -494,9 +525,9 @@ class MahjongGame:
         options: list[ReactionOption] = []
 
         if counts[discard_type] >= 3:
-            options.append(ReactionOption("kan", [discard_type, discard_type, discard_type], "깡", "도라를 늘리지만 수비 여유는 줄어듭니다."))
+            options.append(self._analyze_reaction_option("kan", [discard_type, discard_type, discard_type], from_player, discard_raw))
         if counts[discard_type] >= 2:
-            options.append(ReactionOption("pon", [discard_type, discard_type], "퐁", "속도를 크게 높일 수 있는 호출입니다."))
+            options.append(self._analyze_reaction_option("pon", [discard_type, discard_type], from_player, discard_raw))
 
         if from_player == 3:
             base = discard_type // 9
@@ -511,13 +542,99 @@ class MahjongGame:
                     chi_patterns.append([discard_type + 1, discard_type + 2])
                 for pattern in chi_patterns:
                     if all(t // 9 == base and counts[t] >= 1 for t in pattern):
-                        names = ", ".join(type_to_name(t) for t in pattern)
-                        options.append(ReactionOption("chi", pattern, "치", f"{names}를 써서 순자를 만들 수 있습니다."))
+                        options.append(self._analyze_reaction_option("chi", pattern, from_player, discard_raw))
 
         unique = {}
         for option in options:
             unique[(option.kind, tuple(option.use_types))] = option
         return list(unique.values())
+
+    def _analyze_reaction_option(self, kind: str, use_types: list[int], from_player: int, discard_raw: int) -> ReactionOption:
+        current_options = analyze_discard_options_types(self.players[0].hand, meld_count=self._meld_count(0))
+        current_best = current_options[0] if current_options else None
+        current_shanten = current_best["shanten"] if current_best else None
+        current_effective = current_best["effective_count"] if current_best else 0
+
+        simulated_hand = list(self.players[0].hand)
+        for tile_type in use_types:
+            for idx, raw in enumerate(simulated_hand):
+                if raw_to_type(raw) == tile_type:
+                    simulated_hand.pop(idx)
+                    break
+
+        simulated_melds = [meld.to_client() for meld in self.players[0].melds]
+        called_tile_name = raw_to_name(discard_raw)
+        simulated_melds.append(
+            {
+                "kind": kind,
+                "tiles": [discard_raw] + [next((raw for raw in self.players[0].hand if raw_to_type(raw) == tile_type), discard_raw) for tile_type in use_types],
+                "open": True,
+                "from_player": from_player,
+                "called_tile": discard_raw,
+            }
+        )
+        options_after = analyze_discard_options_types(simulated_hand, meld_count=self._meld_count(0) + 1)
+        best_after = options_after[0] if options_after else None
+        post_shanten = best_after["shanten"] if best_after else current_shanten
+        post_effective = best_after["effective_count"] if best_after else 0
+        best_discard_name = best_after["discard_name"] if best_after else None
+
+        hints_after = get_hand_yaku_hints(
+            hand_raw=simulated_hand + [discard_raw],
+            seat_wind=self._seat_winds()["0"],
+            round_wind=self._round_wind(),
+            open_hand=True,
+        )
+        yaku_preview = [hint["name"] for hint in hints_after[:3]]
+
+        shanten_gain = (current_shanten - post_shanten) if current_shanten is not None and post_shanten is not None else 0
+        effective_delta = post_effective - current_effective
+
+        verdict = "warning"
+        title = {"chi": "치", "pon": "퐁", "kan": "깡"}[kind]
+        reason_parts = []
+
+        if shanten_gain >= 1:
+            verdict = "correct"
+            reason_parts.append(f"샨텐이 {shanten_gain}단계 줄어듭니다.")
+        elif shanten_gain == 0 and effective_delta >= 2:
+            verdict = "correct"
+            reason_parts.append(f"샨텐은 같지만 유효패가 {effective_delta}종 늘어납니다.")
+        elif shanten_gain < 0 or effective_delta <= -3:
+            verdict = "mistake"
+            reason_parts.append("속도와 유효패가 모두 나빠질 가능성이 큽니다.")
+        else:
+            reason_parts.append("속도 이득은 작지만 손패 방향을 고정하는 선택입니다.")
+
+        if kind == "kan":
+            reason_parts.append("도라가 늘고 린샹패를 보지만 수비 선택지는 줄어듭니다.")
+        elif kind == "pon" and discard_type_is_value(discard_raw, self._seat_winds()["0"], self._round_wind()):
+            reason_parts.append("역패 확보에 직접 연결됩니다.")
+            verdict = "correct" if verdict != "mistake" else verdict
+        elif kind == "chi":
+            reason_parts.append("리치 가능성은 사라지므로 타점보다 속도를 선택하는 호출입니다.")
+
+        detail_parts = []
+        if best_after:
+            detail_parts.append(f"울고 나면 {best_discard_name}을 버리는 라인이 가장 무난합니다.")
+            detail_parts.append(f"예상 상태는 {post_shanten}샨텐, 유효패 {post_effective}종입니다.")
+        if yaku_preview:
+            detail_parts.append(f"노릴 수 있는 역: {', '.join(yaku_preview)}")
+        elif kind != "kan":
+            detail_parts.append("보이는 역이 부족하면 울고 나서 타점이 낮아질 수 있습니다.")
+
+        return ReactionOption(
+            kind=kind,
+            use_types=use_types,
+            label=title,
+            reason=" ".join(reason_parts),
+            verdict=verdict,
+            detail=" ".join(detail_parts),
+            shanten_after=post_shanten,
+            effective_after=post_effective,
+            best_discard_name=best_discard_name,
+            yaku_preview=yaku_preview,
+        )
 
     def _take_tiles_by_types(self, player_index: int, use_types: list[int]) -> list[int]:
         hand = self.players[player_index].hand
@@ -534,7 +651,7 @@ class MahjongGame:
     def _maybe_ai_ron(self, discard_raw: int) -> Optional[dict]:
         for player_index in range(1, 4):
             full_hand = self._full_hand(player_index, discard_raw)
-            if check_win(full_hand, meld_count=self._meld_count(player_index)):
+            if check_win(full_hand, meld_count=self._meld_count(player_index)) and self._hand_has_yaku(player_index, discard_raw, False):
                 return self._resolve_win(winner=player_index, win_type="ron", winning_tile=discard_raw, loser=0)
         return None
 
@@ -544,16 +661,23 @@ class MahjongGame:
         melds = [meld.to_client() for meld in self.players[winner].melds]
         open_hand = bool(self.players[winner].melds)
         hand = self._full_hand(winner, None if win_type == "tsumo" else winning_tile)
-        yaku = detect_yaku(
+        evaluation = evaluate_hand(
             hand,
-            self.players[winner].in_riichi,
-            win_type == "tsumo",
+            in_riichi=self.players[winner].in_riichi,
+            is_tsumo=win_type == "tsumo",
             melds=melds,
             seat_wind=self._seat_winds()[str(winner)],
             round_wind=self._round_wind(),
             dora_indicators=self.dora_indicators,
+            winning_tile=winning_tile,
+            is_double_riichi=self._is_double_riichi(winner),
+            is_ippatsu=self.players[winner].ippatsu_pending,
+            is_haitei=(win_type == "tsumo" and self.tiles_remaining() == 0 and not self.last_draw_was_rinshan),
+            is_houtei=(win_type == "ron" and self.last_discard_was_wall_last),
+            is_rinshan=self.last_draw_was_rinshan and win_type == "tsumo",
         )
-        score = estimate_score(yaku, win_type == "tsumo", open_hand=open_hand)
+        yaku = evaluation["yaku"]
+        score = evaluation["score"]
         self._apply_score_delta(winner, loser, score, win_type)
 
         if winner == 0 and self.riichi_sticks:
@@ -561,6 +685,9 @@ class MahjongGame:
             self.riichi_sticks = 0
 
         self.pending_reaction = None
+        self.last_draw_was_rinshan = False
+        self.last_discard_was_wall_last = False
+        self._clear_ippatsu_all()
         return {
             "event": "win_declared",
             "winner": winner,
@@ -570,6 +697,8 @@ class MahjongGame:
             "hand_names": [raw_to_name(r) for r in hand],
             "melds": melds,
             "yaku": yaku,
+            "han": evaluation["han"],
+            "fu": evaluation["fu"],
             "score": score,
             "is_human_win": winner == 0,
             "history": self.history,
@@ -599,3 +728,41 @@ class MahjongGame:
     def _is_furiten(self) -> bool:
         winning_types = set(get_winning_tiles(self.players[0].hand, meld_count=self._meld_count(0)))
         return any(raw_to_type(tile) in winning_types for tile in self.players[0].discards)
+
+    def _hand_has_yaku(self, player_index: int, winning_tile: Optional[int], is_tsumo: bool) -> bool:
+        hand = self._full_hand(player_index, None if is_tsumo else winning_tile)
+        evaluation = evaluate_hand(
+            hand_raw=hand,
+            in_riichi=self.players[player_index].in_riichi,
+            is_tsumo=is_tsumo,
+            melds=[meld.to_client() for meld in self.players[player_index].melds],
+            seat_wind=self._seat_winds()[str(player_index)],
+            round_wind=self._round_wind(),
+            dora_indicators=self.dora_indicators,
+            winning_tile=winning_tile,
+            is_double_riichi=self._is_double_riichi(player_index),
+            is_ippatsu=self.players[player_index].ippatsu_pending,
+            is_haitei=(is_tsumo and self.tiles_remaining() == 0 and not self.last_draw_was_rinshan),
+            is_houtei=((not is_tsumo) and self.last_discard_was_wall_last),
+            is_rinshan=self.last_draw_was_rinshan and is_tsumo,
+        )
+        return any(not name.startswith("도라 ") for name in evaluation["yaku"])
+
+    def _clear_ippatsu_all(self) -> None:
+        for player in self.players:
+            player.ippatsu_pending = False
+
+    def _is_double_riichi(self, player_index: int) -> bool:
+        player = self.players[player_index]
+        if player.riichi_turn is None:
+            return False
+        total_discards = sum(len(p.discards) for p in self.players)
+        total_melds = sum(len(p.melds) for p in self.players)
+        return player.riichi_turn <= 1 and total_discards <= 1 and total_melds == 0
+
+
+def discard_type_is_value(discard_raw: int, seat_wind: str, round_wind: str) -> bool:
+    tile_type = raw_to_type(discard_raw)
+    if tile_type in {31, 32, 33}:
+        return True
+    return tile_type in {WIND_TYPE_MAP.get(seat_wind), WIND_TYPE_MAP.get(round_wind)}

@@ -48,6 +48,11 @@ export default function WinModal({ winData, phase, onNewGame, gameHistory = [], 
                     ))}
                   </div>
                 )}
+                {(winData.han || winData.fu) && (
+                  <p className="text-sm text-slate-400 mb-2">
+                    {winData.han ?? 0}판 {winData.fu ?? 0}부
+                  </p>
+                )}
                 <p className="text-2xl font-bold text-amber-400">
                   {winData.score?.toLocaleString()}점
                 </p>
