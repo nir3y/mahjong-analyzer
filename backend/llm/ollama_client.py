@@ -89,6 +89,33 @@ def explain_pattern(pattern_data: dict) -> str:
     return response["message"]["content"]
 
 
+def explain_realtime_coaching(discard_context: dict) -> str:
+    """
+    실전 게임 중 실시간 코칭 메시지 생성 (짧고 핵심적으로)
+    discard_context: {
+        "your_discard_name": "2만",
+        "best_discard_name": "8삭",
+        "shanten_your": 2,
+        "shanten_best": 1,
+        "effective_count_delta": 5,
+        "hand_names": ["1만", "2만", ...]
+    }
+    """
+    prompt = f"""당신은 리치마작 실전 코치입니다. 플레이어가 방금 패를 버렸습니다.
+핵심만 담아 한국어 2~3문장으로 짧게 피드백해주세요.
+
+손패: {', '.join(discard_context['hand_names'])}
+실제 선택: {discard_context['your_discard_name']} (샨텐수 {discard_context['shanten_your']})
+더 나은 선택: {discard_context['best_discard_name']} (샨텐수 {discard_context['shanten_best']}, 유효패 {discard_context['effective_count_delta']}장 더 많음)
+
+전문 용어는 괄호 안에 간단히 설명해주세요."""
+    response = ollama.chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response["message"]["content"]
+
+
 def analyze_screenshot(image_description: str) -> str:
     """
     스크린샷 상황 분석 및 설명 생성
